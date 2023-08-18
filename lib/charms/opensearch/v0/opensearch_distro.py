@@ -33,7 +33,7 @@ from charms.opensearch.v0.opensearch_exceptions import (
     OpenSearchPluginError,
     OpenSearchStartTimeoutError,
 )
-from charms.opensearch.v0.opensearch_plugins import OpenSearchPluginManager
+from charms.opensearch.v0.opensearch_plugin_manager import OpenSearchPluginManager
 
 # The unique Charmhub library identifier, never change it
 LIBID = "7145c219467d43beb9c566ab4a72c454"
