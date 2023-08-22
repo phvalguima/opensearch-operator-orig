@@ -35,7 +35,13 @@ LIBPATCH = 1
 logger = logging.getLogger(__name__)
 
 
-ConfigExposedPlugins = {}
+ConfigExposedPlugins = {
+    "repository-s3": {
+        "class": OpenSearchBackupPlugin,
+        "config-name": None,
+        "relation-name": "s3-credentials"
+    }
+}
 
 
 class OpenSearchPluginManager:
