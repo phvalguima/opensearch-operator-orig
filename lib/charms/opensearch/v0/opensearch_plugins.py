@@ -216,7 +216,3 @@ class OpenSearchPlugin:
     def name(self) -> str:
         """Returns the name of the plugin."""
         return self._name
-
-    def _get_config(self, config_name: str) -> Any:
-        """Gets a configuration from opensearch.yml."""
-        return self._plugin_manager.check_plugin_config(self.name, config_name)

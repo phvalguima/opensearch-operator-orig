@@ -39,7 +39,7 @@ ConfigExposedPlugins = {
     "repository-s3": {
         "class": OpenSearchBackupPlugin,
         "config-name": None,
-        "relation-name": "s3-credentials"
+        "relation-name": "s3-credentials",
     }
 }
 

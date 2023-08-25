@@ -1,26 +1,34 @@
+# Copyright 2023 Canonical Ltd.
+# See LICENSE file for licensing details.
+
 """Manage backup configurations and actions.
 
-This class must load the opensearch plugin: s3-repository and configure it.
+This class must load the opensearch plugin: repository-s3 and configure it.
+
+The setup of s3-repository happens in two phases: (1) at credentials-changed event, where
+the backup configuration is made in opensearch.yml and the opensearch-keystore; (2) when
+the first action is requested and the actual registration of the repo takes place.
+
+That needs to be separated in two phases as the configuration itself will demand a restart,
+before configuring the actual snapshot repo is possible in OpenSearch.
+
+The removal of backup only reverses step (1), to avoid accidentally deleting the existing
+snapshots in the S3 repo.
 """
 
 import logging
-from typing import Dict, List, Optional, Union, Any
+from typing import Any, Dict, List, Optional, Union
 
-from charms.opensearch.v0.opensearch_plugins import OpenSearchPlugin
 from charms.data_platform_libs.v0.s3 import S3Requirer
 from charms.opensearch.v0.constants_charm import OPENSEARCH_REPOSITORY_NAME
-from ops.framework import Object
-from ops.model import (
-    ActiveStatus,
-    BlockedStatus,
-    StatusBase,
-    MaintenanceStatus
-)
 from charms.opensearch.v0.opensearch_exceptions import (
-    OpenSearchPluginError,
+    OpenSearchBackupRestoreError,
     OpenSearchKeystoreError,
-    OpenSearchUnknownBackupRestoreError
+    OpenSearchPluginError,
 )
+from charms.opensearch.v0.opensearch_plugins import OpenSearchPlugin
+from ops.framework import Object
+from ops.model import ActiveStatus, BlockedStatus, MaintenanceStatus, StatusBase
 
 # The unique Charmhub library identifier, never change it
 LIBID = "d301deee4d2c4c1b8e30cd3df8034be2"
@@ -56,9 +64,9 @@ REPO_NOT_ACCESS_ERR = (
 class OpenSearchBackup(OpenSearchPlugin):
     """Implements backup plugin."""
 
-    def __init__(self, name: str, charm: Object, relname: Optional[str]):
+    def __init__(self, name: str, charm: Object, relname: Optional[str] = None):
         """Manager of OpenSearch client relations."""
-        super().__init__(charm, name, charm, relname)
+        super().__init__(name, charm, relname)
 
         # s3 relation handles the config options for s3 backups
         self.s3_client = S3Requirer(self.charm, relname)
@@ -68,6 +76,11 @@ class OpenSearchBackup(OpenSearchPlugin):
         self.framework.observe(
             self.s3_client.on.credentials_changed, self._on_s3_credential_changed
         )
+
+    @property
+    def depends_on(self) -> List[str]:
+        """Returns the dependency list for this plugin."""
+        return []
 
     def upgrade(self, uri: str) -> None:
         """Runs the upgrade process in this plugin."""
@@ -79,41 +92,65 @@ class OpenSearchBackup(OpenSearchPlugin):
 
     def disable(self) -> bool:
         """Disables the plugin."""
-        return self._on_s3_credential_departed()
+        if not self.is_enabled():
+            logger.warn("Depart event received but plugin not enabled yet.")
+            raise OpenSearchBackupRestoreError("Depart event received but plugin not enabled yet.")
+        s3_credentials = self.s3_client.get_s3_connection_info()
+        return self.uninstall(
+            "repository-s3",
+            {
+                **S3_OPENSEARCH_EXTRA_VALUES,
+                "s3.client.default.region": s3_credentials["region"],
+                "s3.client.default.endpoint": s3_credentials["endpoint"],
+            },
+            keystore={
+                "s3.client.default.access_key": s3_credentials["access-key"],
+                "s3.client.default.secret_key": s3_credentials["secret-key"],
+            },
+        )
 
     def enable(self) -> bool:
-        """Enables the plugin.
+        """Enables the plugin."""
+        restart_needed = False
+        if self._check_missing_s3_config_completeness():
+            BlockedStatus(f"Missing s3 info: {self._check_missing_s3_config_completeness()}")
+            raise OpenSearchBackupRestoreError(
+                f"Missing s3 info: {self._check_missing_s3_config_completeness()}"
+            )
+        if not self.is_installed():
+            restart_needed = self.install("repository-s3") or restart_needed
+        s3_credentials = self.s3_client.get_s3_connection_info()
+        restart_needed = (
+            self.configure(
+                {
+                    **S3_OPENSEARCH_EXTRA_VALUES,
+                    "s3.client.default.region": s3_credentials["region"],
+                    "s3.client.default.endpoint": s3_credentials["endpoint"],
+                },
+                keystore={
+                    "s3.client.default.access_key": s3_credentials["access-key"],
+                    "s3.client.default.secret_key": s3_credentials["secret-key"],
+                },
+            )
+            or restart_needed
+        )
+        return restart_needed
 
-        There is no point in having enable with backup, as we are dependent on relation.
-        """
-        raise NotImplementedError
-
-    def _check_s3_config_completeness(self) -> List[str]:
+    def _check_missing_s3_config_completeness(self) -> List[str]:
         return [
-            config for config in ["region", "bucket", "access-key", "secret-key"]
+            config
+            for config in ["region", "bucket", "access-key", "secret-key"]
             if config not in self.s3_client.get_s3_connection_info()
         ]
 
     def _on_s3_credential_departed(self, event) -> None:
         """Uninstalls the backup plugin."""
-        restart_needed = False
         try:
-            if not self.is_enabled():
-                logger.warn("Depart event received but plugin not enabled yet.")
-                return
-            s3_credentials = self.s3_client.get_s3_connection_info()
-            restart_needed = self.uninstall("repository-s3", {
-                **S3_OPENSEARCH_EXTRA_VALUES,
-                "s3.client.default.region": s3_credentials["region"],
-                "s3.client.default.endpoint": s3_credentials["endpoint"]
-            }, 
-            keystore={
-                "s3.client.default.access_key": s3_credentials["access-key"],
-                "s3.client.default.secret_key": s3_credentials["secret-key"]
-            })
+            restart_needed = self.disable()
         except (
             OpenSearchKeystoreError,
             OpenSearchPluginError,
+            OpenSearchBackupRestoreError,
         ) as e:
             logger.exception(e)
             logger.error("Error during backup setup")
@@ -127,30 +164,17 @@ class OpenSearchBackup(OpenSearchPlugin):
 
     def _on_s3_credential_changed(self, event) -> None:
         """Sets credentials, resyncs if necessary and reports config errors.
+
         The first pass in this method should return false for the registration, then the
         backup plugin is installed and configured.
         """
         restart_needed = False
         try:
-            if not self._check_s3_config_completeness():
-                BlockedStatus(f"Missing s3 info: {self._check_s3_config_completeness()}")
-                event.defer()
-                return
-            if not self.is_installed():
-                restart_needed = restart_needed or self.install("repository-s3")
-            s3_credentials = self.s3_client.get_s3_connection_info()
-            restart_needed = restart_needed or self.configure({
-                **S3_OPENSEARCH_EXTRA_VALUES,
-                "s3.client.default.region": s3_credentials["region"],
-                "s3.client.default.endpoint": s3_credentials["endpoint"]
-                }, 
-            keystore={
-                "s3.client.default.access_key": s3_credentials["access-key"],
-                "s3.client.default.secret_key": s3_credentials["secret-key"]
-            })
+            restart_needed = self.enable()
         except (
             OpenSearchKeystoreError,
             OpenSearchPluginError,
+            OpenSearchBackupRestoreError,
         ) as e:
             logger.exception(e)
             logger.error("Error during backup setup")
@@ -172,7 +196,7 @@ class OpenSearchBackup(OpenSearchPlugin):
         5: missing snapshot
         6: error during restore
         7: unknown error
-        
+
         Based on:
         https://github.com/opensearch-project/OpenSearch/blob/
             ba78d93acf1da6dae16952d8978de87cb4df2c61/
@@ -180,7 +204,7 @@ class OpenSearchBackup(OpenSearchPlugin):
         https://github.com/opensearch-project/OpenSearch/blob/
             ba78d93acf1da6dae16952d8978de87cb4df2c61/
             plugins/repository-s3/src/yamlRestTest/resources/rest-api-spec/test/repository_s3/40_repository_ec2_credentials.yml
-        
+
         """
         try:
             if "error" not in response:
@@ -256,7 +280,7 @@ class OpenSearchBackup(OpenSearchPlugin):
         try:
             # Check if we error'ed b/c of missing snapshot repo
             if self._process_http_response(get) != 2:
-                raise OpenSearchUnknownBackupRestoreError("Snapshot repo is wrongly set")
+                raise OpenSearchBackupRestoreError("Snapshot repo is wrongly set")
             if (
                 bucket_name
                 and bucket_name not in get["charmed-s3-repository"]["settings"]["bucket"]
@@ -265,7 +289,7 @@ class OpenSearchBackup(OpenSearchPlugin):
                 return False
         except KeyError:
             # One of the error keys are not present, this is a deeper issue
-            raise OpenSearchUnknownBackupRestoreError("Snapshot repo is wrongly set")
+            raise OpenSearchBackupRestoreError("Snapshot repo is wrongly set")
         return True
 
     def register_snapshot_repo(self) -> bool:
@@ -290,9 +314,7 @@ class OpenSearchBackup(OpenSearchPlugin):
             return self._process_http_response(put)
         finally:
             # Unknown condition reached
-            raise OpenSearchUnknownBackupRestoreError(
-                "register_snapshot_repo - unknown"
-            )
+            raise OpenSearchBackupRestoreError("register_snapshot_repo - unknown")
 
     def get_status(self) -> Union[int, StatusBase]:
         """Get the backup status.
