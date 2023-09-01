@@ -384,6 +384,10 @@ class OpenSearchBaseCharm(CharmBase):
                 event.defer()
                 return
 
+        # Check backup status
+        if self.model.get_relation("s3-credentials") is not None:
+            self.unit.status = self.backup.status()
+
         for relation in self.model.relations.get(ClientRelationName, []):
             self.opensearch_provider.update_endpoints(relation)
 

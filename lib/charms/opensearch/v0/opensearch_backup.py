@@ -1,19 +1,9 @@
 # Copyright 2023 Canonical Ltd.
 # See LICENSE file for licensing details.
 
-"""Manage backup configurations and actions.
+"""Manage backup configurations.
 
 This class must load the opensearch plugin: repository-s3 and configure it.
-
-The setup of s3-repository happens in two phases: (1) at credentials-changed event, where
-the backup configuration is made in opensearch.yml and the opensearch-keystore; (2) when
-the first action is requested and the actual registration of the repo takes place.
-
-That needs to be separated in two phases as the configuration itself will demand a restart,
-before configuring the actual snapshot repo is possible in OpenSearch.
-
-The removal of backup only reverses step (1), to avoid accidentally deleting the existing
-snapshots in the S3 repo.
 """
 
 import logging
@@ -26,6 +16,8 @@ from charms.opensearch.v0.opensearch_exceptions import (
     OpenSearchKeystoreError,
     OpenSearchPluginError,
 )
+from charms.opensearch.v0.helper_enums import BaseStrEnum
+
 from charms.opensearch.v0.opensearch_plugins import OpenSearchPlugin
 from ops.framework import Object
 from ops.model import ActiveStatus, BlockedStatus, MaintenanceStatus, StatusBase
@@ -61,21 +53,30 @@ REPO_NOT_ACCESS_ERR = (
 )
 
 
-class OpenSearchBackup(OpenSearchPlugin):
+class BackupServiceState(BaseStrEnum):
+    """Enum for the states possible once plugin is enabled."""
+
+    SUCCESS = "success"
+    RESPONSE_FAILED_NETWORK = "response failed: network error"
+    RESPONSE_FAILED_UNKNOWN = "response failed: unknown reason"
+    REPO_NOT_CREATED = "repository not created"
+    REPO_MISSING = "repository is missing from request"
+    REPO_S3_UNREACHABLE = "repository s3 is unreachable"
+    ILLEGAL_ARGUMENT = "request contained wrong argument"
+    SNAPSHOT_MISSING = "snapshot not found"
+    SNAPSHOT_RESTORE_ERROR = "restore of snapshot failed"
+    SNAPSHOT_IN_PROGRESS = "snapshot in progress"
+    SNAPSHOT_PARTIALLY_TAKEN = "snapshot partial: at least one shard missing"
+    SNAPSHOT_INCOMPATIBILITY = "snapshot failed: incompatibility issues"
+    SNAPSHOT_FAILED_UNKNOWN = "snapshot failed for unknown reason"
+
+
+class OpenSearchBackupPlugin(OpenSearchPlugin):
     """Implements backup plugin."""
 
-    def __init__(self, name: str, charm: Object, relname: Optional[str] = None):
+    def __init__(self, name: str):
         """Manager of OpenSearch client relations."""
-        super().__init__(name, charm, relname)
-
-        # s3 relation handles the config options for s3 backups
-        self.s3_client = S3Requirer(self.charm, relname)
-        self.framework.observe(
-            self.charm.on[relname].relation_departed, self._on_s3_credential_departed
-        )
-        self.framework.observe(
-            self.s3_client.on.credentials_changed, self._on_s3_credential_changed
-        )
+        super().__init__(name)
 
     @property
     def depends_on(self) -> List[str]:
@@ -136,66 +137,15 @@ class OpenSearchBackup(OpenSearchPlugin):
         )
         return restart_needed
 
-    def _check_missing_s3_config_completeness(self) -> List[str]:
+    def check_missing_s3_config_completeness(self) -> List[str]:
         return [
             config
             for config in ["region", "bucket", "access-key", "secret-key"]
             if config not in self.s3_client.get_s3_connection_info()
         ]
 
-    def _on_s3_credential_departed(self, event) -> None:
-        """Uninstalls the backup plugin."""
-        try:
-            restart_needed = self.disable()
-        except (
-            OpenSearchKeystoreError,
-            OpenSearchPluginError,
-            OpenSearchBackupRestoreError,
-        ) as e:
-            logger.exception(e)
-            logger.error("Error during backup setup")
-            # Something went wrong
-            event.defer()
-            return
-        if restart_needed:
-            self.charm.on[self.charm.service_manager.name].acquire_lock.emit(
-                callback_override="_restart_opensearch"
-            )
-
-    def _on_s3_credential_changed(self, event) -> None:
-        """Sets credentials, resyncs if necessary and reports config errors.
-
-        The first pass in this method should return false for the registration, then the
-        backup plugin is installed and configured.
-        """
-        restart_needed = False
-        try:
-            restart_needed = self.enable()
-        except (
-            OpenSearchKeystoreError,
-            OpenSearchPluginError,
-            OpenSearchBackupRestoreError,
-        ) as e:
-            logger.exception(e)
-            logger.error("Error during backup setup")
-            # Something went wrong
-            event.defer()
-            return
-        if restart_needed:
-            self.charm.on[self.charm.service_manager.name].acquire_lock.emit(
-                callback_override="_restart_opensearch"
-            )
-
-    def _process_http_response(self, response: Dict[str, Any]) -> int:
-        """Returns 0 if everything fine or a number higher than 0 otherwise.
-
-        1: repository not found
-        2: repository missing
-        3: error while trying to access repository
-        4: illegal argument exception
-        5: missing snapshot
-        6: error during restore
-        7: unknown error
+    def get_service_status(self, response: Dict[str, Any]) -> BackupServiceState:
+        """Returns the response status in a Enum.
 
         Based on:
         https://github.com/opensearch-project/OpenSearch/blob/
@@ -204,137 +154,40 @@ class OpenSearchBackup(OpenSearchPlugin):
         https://github.com/opensearch-project/OpenSearch/blob/
             ba78d93acf1da6dae16952d8978de87cb4df2c61/
             plugins/repository-s3/src/yamlRestTest/resources/rest-api-spec/test/repository_s3/40_repository_ec2_credentials.yml
-
         """
         try:
             if "error" not in response:
                 return 0
             type = response["error"]["root_cause"][0]["type"]
             reason = response["error"]["root_cause"][0]["reason"]
-            # Check if we error'ed b/c s3 repo is not configured, hence we are still
-            # waiting for the plugin to be configured
-            if type == "repository_exception" and REPO_NOT_CREATED_ERR in reason:
-                logger.warn("repository_exception: repo [s3] not found")
-                return 1
-            if type == "repository_missing_exception":
-                logger.warn("repository missing")
-                return 2
-            if type == "repository_verification_exception" and REPO_NOT_ACCESS_ERR in reason:
-                logger.warn("repository_verification_exception: error trying to reach to s3")
-                return 3
-            if type == "illegal_argument_exception":
-                logger.warn("illegal_argument_exception: wrong argument provided")
-                return 4
-            if type == "snapshot_missing_exception":
-                logger.warn("snapshot_missing_exception: snapshot not found")
-                return 5
-            if type == "snapshot_restore_exception":
-                logger.warn("snapshot_restore_exception: restore error")
-                return 6
         except KeyError as e:
             logger.exception(e)
             logger.error("response contained unknown error code")
-            return 7
+            return BackupServiceState.RESPONSE_FAILED_UNKNOWN
+        # Check if we error'ed b/c s3 repo is not configured, hence we are still
+        # waiting for the plugin to be configured
+        if type == "repository_exception" and REPO_NOT_CREATED_ERR in reason:
+            return BackupServiceState.REPO_NOT_CREATED
+        if type == "repository_missing_exception":
+            return BackupServiceState.REPO_MISSING
+        if type == "repository_verification_exception" and REPO_NOT_ACCESS_ERR in reason:
+            return BackupServiceState.REPO_S3_UNREACHABLE
+        if type == "illegal_argument_exception":
+            return BackupServiceState.ILLEGAL_ARGUMENT
+        if type == "snapshot_missing_exception":
+            return BackupServiceState.SNAPSHOT_MISSING
+        if type == "snapshot_restore_exception":
+            return BackupServiceState.SNAPSHOT_RESTORE_ERROR
 
-    def _check_repo_status(self) -> Union[int, StatusBase]:
-        try:
-            response = self._request("GET", f"_snapshot/{OPENSEARCH_REPOSITORY_NAME}")
-            logger.debug(f"_check_repo_status response: {response}")
-            if self._process_http_response(response) > 0:
-                return self._process_http_response(response), BlockedStatus("")
-        except Exception as e:
-            logger.exception(e)
-            logger.error("Unknown backup failure")
-            return BlockedStatus("backup service failed: unknown")
-
-    def _check_snapshot_status(self) -> Union[int, StatusBase]:
-        try:
-            response = self._request("GET", "/_snapshot/_status")
-            logger.debug(f"_check_snapshot_status response: {response}")
-            if self._process_http_response(response) > 0:
-                return self._process_http_response(response), BlockedStatus("")
-        except Exception as e:
-            logger.exception(e)
-            logger.error("Unknown backup failure")
-            return BlockedStatus("backup service failed: unknown")
-
-        # Check state:
+        # Now, check snapshot status:
         if "SUCCESS" in response:
-            return 10, ActiveStatus("")
+            return BackupServiceState.SUCCESS
         if "IN_PROGRESS" in response:
-            return 11, MaintenanceStatus("backup in progress")
+            return BackupServiceState.SNAPSHOT_IN_PROGRESS
         if "PARTIAL" in response:
-            return 12, BlockedStatus("partial backup: at least one shard failed to backup")
+            return BackupServiceState.SNAPSHOT_PARTIALLY_TAKEN
         if "INCOMPATIBLE" in response:
-            return 13, BlockedStatus("backup failed: compatibility problems")
+            return BackupServiceState.SNAPSHOT_INCOMPATIBILITY
         if "FAILED" in response:
-            return 14, BlockedStatus("backup service failed: unknown")
-        return 0, ActiveStatus("")
-
-    def check_if_snapshot_repo_created(self, bucket_name: str = "") -> bool:
-        """Returns True if the snapshot repo has already been created.
-
-        If bucket_name is set, then compare it in the response as well.
-        """
-        get = self._request("GET", f"_snapshot/{OPENSEARCH_REPOSITORY_NAME}")
-        try:
-            # Check if we error'ed b/c of missing snapshot repo
-            if self._process_http_response(get) != 2:
-                raise OpenSearchBackupRestoreError("Snapshot repo is wrongly set")
-            if (
-                bucket_name
-                and bucket_name not in get["charmed-s3-repository"]["settings"]["bucket"]
-            ):
-                # bucket name changed, recreate the repo
-                return False
-        except KeyError:
-            # One of the error keys are not present, this is a deeper issue
-            raise OpenSearchBackupRestoreError("Snapshot repo is wrongly set")
-        return True
-
-    def register_snapshot_repo(self) -> bool:
-        """Registers the snapshot repo in the cluster."""
-        info = self.s3_client.get_s3_connection_info()
-        bucket_name = info["bucket"]
-        try:
-            if self.check_if_snapshot_repo_created(bucket_name):
-                # We've already created the repo, leaving...
-                return True
-            put = self._request(
-                "PUT",
-                f"_snapshot/{OPENSEARCH_REPOSITORY_NAME}",
-                payload={
-                    "type": "s3",
-                    "settings": {
-                        "bucket": bucket_name,
-                        "base_path": S3_REPO_BASE_PATH,
-                    },
-                },
-            )
-            return self._process_http_response(put)
-        finally:
-            # Unknown condition reached
-            raise OpenSearchBackupRestoreError("register_snapshot_repo - unknown")
-
-    def get_status(self) -> Union[int, StatusBase]:
-        """Get the backup status.
-
-        The possible status are for the super() status:
-        0: blocked, not installed
-        1: blocked, not enabled
-        2: active
-        3: blocked, waiting for an upgrade action
-        """
-        code, status = super().get_status()
-        if code != 2:
-            return code, status
-
-        # Active status according to the base plugin, check backup specifics
-        repo_code, repo_status = self._check_repo_status()
-        if repo_code > 0:
-            return 40 + repo_code, repo_status
-
-        # Check snapshot status
-        snapshot_code, snapshot_status = self._check_snapshot_status()
-        if snapshot_code > 0:
-            return 50 + snapshot_code, snapshot_status
+            return BackupServiceState.SNAPSHOT_FAILED_UNKNOWN
+        return BackupServiceState.SUCCESS

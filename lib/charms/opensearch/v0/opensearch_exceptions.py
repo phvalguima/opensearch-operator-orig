@@ -109,7 +109,3 @@ class OpenSearchPluginError(OpenSearchError):
 
 class OpenSearchKeystoreError(OpenSearchError):
     """Exception thrown when an opensearch keystore is invalid."""
-
-
-class OpenSearchBackupRestoreError(OpenSearchError):
-    """Exception thrown when an opensearch backup-related action fails."""
