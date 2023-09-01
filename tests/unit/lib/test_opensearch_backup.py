@@ -72,7 +72,7 @@ class TestOpenSearchBackup(unittest.TestCase):
             },
         )
 
-        mock_add_plugin.assert_called_once_with("repository-s3", batch=True)
+        mock_add_plugin.assert_called_once_with("repository-s3")
         mock_acquire_lock.assert_called()
         yaml_setter_put_calls = [
             call("opensearch.yml", "s3.client.default.endpoint", "localhost"),
@@ -88,8 +88,8 @@ class TestOpenSearchBackup(unittest.TestCase):
         # mock_yaml_setter_put.assert_has_calls(yaml_setter_put_calls)
         mock_add_ks.assert_has_calls(
             [
-                call("s3.client.default.access_key", "aaaa", force=True),
-                call("s3.client.default.secret_key", "bbbb", force=True),
+                call("s3.client.default.access_key", "aaaa"),
+                call("s3.client.default.secret_key", "bbbb"),
             ]
         )
         mock_request.assert_has_calls([call("POST", "_nodes/reload_secure_settings")])
