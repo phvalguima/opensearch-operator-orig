@@ -14,6 +14,7 @@ import logging
 from typing import List
 
 from charms.opensearch.v0.opensearch_exceptions import OpenSearchCmdError
+from charms.opensearch.v0.opensearch_ml_plugins import OpenSearchKnn
 from charms.opensearch.v0.opensearch_plugins import (
     OpenSearchPlugin,
     OpenSearchPluginError,
@@ -37,7 +38,13 @@ LIBPATCH = 1
 logger = logging.getLogger(__name__)
 
 
-ConfigExposedPlugins = {}
+ConfigExposedPlugins = {
+    "opensearch-knn": {
+        "class": OpenSearchKnn,
+        "config-name": "plugin_opensearch_knn",
+        "relation-name": None,
+    }
+}
 
 
 class OpenSearchPluginManager:
