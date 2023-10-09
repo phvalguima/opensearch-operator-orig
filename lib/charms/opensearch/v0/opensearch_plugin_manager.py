@@ -13,6 +13,7 @@ config-changed, upgrade, s3-credentials-changed, etc.
 import logging
 from typing import Any, Dict, List, Optional
 
+from charms.opensearch.v0.opensearch_health import HealthColors
 from charms.opensearch.v0.opensearch_backups import OpenSearchBackupPlugin
 from charms.opensearch.v0.opensearch_exceptions import (
     OpenSearchCmdError,
@@ -107,6 +108,13 @@ class OpenSearchPluginManager:
 
         This method should be called at config-changed event. Returns if needed restart.
         """
+        if self._charm.health.apply() != HealthColors.GREEN:
+            # If the health is not green, then raise a cluster-not-ready error
+            # The classes above should then defer their own events in waiting.
+            # Defer is important as next steps to configure plugins will involve
+            # calls to the APIs of the cluster.
+            raise OpenSearchPluginRelationClusterNotReadyError()
+
         restart_needed = False
         for plugin in self.plugins:
             restart_needed = any(
@@ -230,6 +238,14 @@ class OpenSearchPluginManager:
         # If not requested to be disabled, check if options are configured or not
         are_configs_enabled = plugin.config().config_entries_to_add
         stored_plugin_conf = self._opensearch_config.get_plugin(are_configs_enabled)
+        # Compare dicts
+        list_a = list(are_configs_enabled.keys())
+        list_a.sort()
+        list_b = list(stored_plugin_conf.keys())
+        list_b.sort()
+        if list_a != list_b:
+            # Keys do not match
+            return False
         for key, val in stored_plugin_conf.items():
             if are_configs_enabled.get(key) != val:
                 return False
