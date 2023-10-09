@@ -14,7 +14,10 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from charms.opensearch.v0.opensearch_backups import OpenSearchBackupPlugin
-from charms.opensearch.v0.opensearch_exceptions import OpenSearchCmdError
+from charms.opensearch.v0.opensearch_exceptions import (
+    OpenSearchCmdError,
+    OpenSearchError,
+)
 from charms.opensearch.v0.opensearch_keystore import OpenSearchKeystore
 from charms.opensearch.v0.opensearch_plugins import (
     OpenSearchKnn,
@@ -23,6 +26,7 @@ from charms.opensearch.v0.opensearch_plugins import (
     OpenSearchPluginError,
     OpenSearchPluginInstallError,
     OpenSearchPluginMissingDepsError,
+    OpenSearchPluginRelationClusterNotReadyError,
     OpenSearchPluginRemoveError,
     PluginState,
 )
@@ -233,9 +237,17 @@ class OpenSearchPluginManager:
 
     def _needs_upgrade(self, plugin: OpenSearchPlugin) -> bool:
         """Returns true if plugin needs upgrade."""
-        current_version = plugin.version
-        num_points = len(self._opensearch.version.split("."))
-        return self._opensearch.version != current_version[:num_points]
+        try:
+            # Plugins may have versioning slightly different than opensearch's:
+            version = self._opensearch.version
+            num_points = min(len(plugin.version.split(".")), len(version.split(".")))
+            return version[:num_points] != plugin.version[:num_points]
+        except OpenSearchError:
+            # A race condition may happen if plugins with relation events happen too early
+            # then, this method will be called before the cluster is ready.
+            # This exception should trigger a Plugin-specific error, which will be used
+            # by upper classes to defer their own event.
+            raise OpenSearchPluginRelationClusterNotReadyError()
 
     def _is_plugin_relation_set(self, relation_name: str) -> bool:
         """Returns True if a relation is expected and it is set."""
