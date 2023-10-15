@@ -26,6 +26,7 @@ from charms.opensearch.v0.opensearch_plugins import (
     OpenSearchPluginConfig,
     OpenSearchPluginError,
     OpenSearchPluginInstallError,
+    OpenSearchPluginMissingConfigError,
     OpenSearchPluginMissingDepsError,
     OpenSearchPluginRelationClusterNotReadyError,
     OpenSearchPluginRemoveError,
@@ -138,22 +139,24 @@ class OpenSearchPluginManager:
         """
         installed_plugins = self._installed_plugins()
 
-        if self.status(plugin) != PluginState.MISSING or not self._user_requested_to_enable(
-            plugin
-        ):
-            # Nothing to do here
-            return False
-
-        # Check for dependencies
-        missing_deps = [dep for dep in plugin.dependencies if dep not in installed_plugins]
-        if missing_deps:
-            raise OpenSearchPluginMissingDepsError(
-                f"Failed to install {plugin.name}, missing dependencies: {missing_deps}"
-            )
-
         # Add the plugin
         try:
+            if self.status(plugin) != PluginState.MISSING or not self._user_requested_to_enable(
+                plugin
+            ):
+                # Nothing to do here
+                return False
+
+            # Check for dependencies
+            missing_deps = [dep for dep in plugin.dependencies if dep not in installed_plugins]
+            if missing_deps:
+                raise OpenSearchPluginMissingDepsError(
+                    f"Failed to install {plugin.name}, missing dependencies: {missing_deps}"
+                )
+
             self._opensearch.run_bin("opensearch-plugin", f"install --batch {plugin.name}")
+        except KeyError as e:
+            raise OpenSearchPluginMissingConfigError(e)
         except OpenSearchCmdError as e:
             if "already exists" in str(e):
                 logger.info(f"Plugin {plugin.name} already installed, continuing...")
@@ -165,26 +168,32 @@ class OpenSearchPluginManager:
 
     def _configure_if_needed(self, plugin: OpenSearchPlugin) -> bool:
         """Gathers all the configuration changes needed and applies them."""
-        if (
-            not self._user_requested_to_enable(plugin)
-            or self.status(plugin) != PluginState.INSTALLED
-        ):
-            # Leave this method if either user did not request to enable this plugin
-            # or plugin has been already enabled.
-            return False
-        return self._apply_config(plugin.config())
+        try:
+            if (
+                not self._user_requested_to_enable(plugin)
+                or self.status(plugin) != PluginState.INSTALLED
+            ):
+                # Leave this method if either user did not request to enable this plugin
+                # or plugin has been already enabled.
+                return False
+            return self._apply_config(plugin.config())
+        except KeyError as e:
+            raise OpenSearchPluginMissingConfigError(e)
 
     def _disable_if_needed(self, plugin: OpenSearchPlugin) -> bool:
         """If disabled, removes plugin configuration or sets it to other values."""
-        if self._user_requested_to_enable(plugin) or self.status(plugin) not in [
-            PluginState.ENABLED,
-            PluginState.WAITING_FOR_UPGRADE,
-        ]:
-            # Only considering "INSTALLED" or "WAITING FOR UPGRADE" status as it
-            # represents a plugin that has been installed but either not yet configured
-            # or user explicitly disabled.
-            return False
-        return self._apply_config(plugin.disable())
+        try:
+            if self._user_requested_to_enable(plugin) or self.status(plugin) not in [
+                PluginState.ENABLED,
+                PluginState.WAITING_FOR_UPGRADE,
+            ]:
+                # Only considering "INSTALLED" or "WAITING FOR UPGRADE" status as it
+                # represents a plugin that has been installed but either not yet configured
+                # or user explicitly disabled.
+                return False
+            return self._apply_config(plugin.disable())
+        except KeyError as e:
+            raise OpenSearchPluginMissingConfigError(e)
 
     def _apply_config(self, config: OpenSearchPluginConfig) -> bool:
         """Runs the configuration changes as passed via OpenSearchPluginConfig.
@@ -239,20 +248,24 @@ class OpenSearchPluginManager:
     def _is_enabled(self, plugin: OpenSearchPlugin) -> bool:
         """Returns true if plugin is enabled."""
         # If not requested to be disabled, check if options are configured or not
-        are_configs_enabled = plugin.config().config_entries_to_add
-        stored_plugin_conf = self._opensearch_config.get_plugin(are_configs_enabled)
-        # Compare dicts
-        list_a = list(are_configs_enabled.keys())
-        list_a.sort()
-        list_b = list(stored_plugin_conf.keys())
-        list_b.sort()
-        if list_a != list_b:
-            # Keys do not match
-            return False
-        for key, val in stored_plugin_conf.items():
-            if are_configs_enabled.get(key) != val:
+        try:
+            are_configs_enabled = plugin.config().config_entries_to_add
+            stored_plugin_conf = self._opensearch_config.get_plugin(are_configs_enabled)
+            # Compare dicts
+            list_a = list(are_configs_enabled.keys())
+            list_a.sort()
+            list_b = list(stored_plugin_conf.keys())
+            list_b.sort()
+            if list_a != list_b:
+                # Keys do not match
                 return False
-        return True
+            for key, val in stored_plugin_conf.items():
+                if are_configs_enabled.get(key) != val:
+                    return False
+            return True
+        except (KeyError, OpenSearchPluginError) as e:
+            logger.warning(f"_is_enabled: error with {e}")
+            return False
 
     def _needs_upgrade(self, plugin: OpenSearchPlugin) -> bool:
         """Returns true if plugin needs upgrade."""
