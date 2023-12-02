@@ -95,6 +95,13 @@ class OpenSearchPluginManager:
                 return plugin
         raise KeyError(f"Plugin manager did not find plugin: {plugin_class}")
 
+    def get_plugin_status(self, plugin_class: OpenSearchPlugin) -> OpenSearchPlugin:
+        """Returns a given plugin based on its class."""
+        for plugin in self.plugins:
+            if isinstance(plugin, plugin_class):
+                return self.status(plugin)
+        raise KeyError(f"Plugin manager did not find plugin: {plugin_class}")
+
     def _extra_conf(self, plugin_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Returns the config from the relation data of the target plugin if applies."""
         relation_name = plugin_data.get("relation")
@@ -111,7 +118,8 @@ class OpenSearchPluginManager:
         """
         if (
             not self._charm.opensearch.is_started()
-            or self._charm.health.apply() != HealthColors.GREEN
+            and (self._charm.health.apply() != HealthColors.GREEN
+                 or self._charm.health.apply() != HealthColors.YELLOW)
         ):
             # If the health is not green, then raise a cluster-not-ready error
             # The classes above should then defer their own events in waiting.
@@ -249,37 +257,20 @@ class OpenSearchPluginManager:
         """Returns true if plugin is enabled."""
         # If not requested to be disabled, check if options are configured or not
         try:
-            are_configs_enabled = plugin.config().config_entries_to_add
-            stored_plugin_conf = self._opensearch_config.get_plugin(are_configs_enabled)
-            # Compare dicts
-            list_a = list(are_configs_enabled.keys())
-            list_a.sort()
-            list_b = list(stored_plugin_conf.keys())
-            list_b.sort()
-            if list_a != list_b:
-                # Keys do not match
-                return False
-            for key, val in stored_plugin_conf.items():
-                if are_configs_enabled.get(key) != val:
-                    return False
-            return True
+            plugin_conf = plugin.config().config_entries_to_add
+            stored_plugin_conf = self._opensearch_config.get_plugin(plugin_conf)
+            return plugin_conf == stored_plugin_conf
         except (KeyError, OpenSearchPluginError) as e:
             logger.warning(f"_is_enabled: error with {e}")
             return False
 
     def _needs_upgrade(self, plugin: OpenSearchPlugin) -> bool:
         """Returns true if plugin needs upgrade."""
-        try:
-            # Plugins may have versioning slightly different than opensearch's:
-            version = self._opensearch.version
-            num_points = min(len(plugin.version.split(".")), len(version.split(".")))
-            return version[:num_points] != plugin.version[:num_points]
-        except OpenSearchError:
-            # A race condition may happen if plugins with relation events happen too early
-            # then, this method will be called before the cluster is ready.
-            # This exception should trigger a Plugin-specific error, which will be used
-            # by upper classes to defer their own event.
-            raise OpenSearchPluginRelationClusterNotReadyError()
+        version = self._opensearch.version.split(".")
+        # Some plugins are formatted as "x.y.z.a", which is different than opensearch's
+        plugin_version = plugin.version.split(".")
+        num_points = min(len(plugin_version), len(version))
+        return ".".join(version[:num_points]) != ".".join(plugin_version[:num_points])
 
     def _is_plugin_relation_set(self, relation_name: str) -> bool:
         """Returns True if a relation is expected and it is set."""
