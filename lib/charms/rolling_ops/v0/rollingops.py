@@ -330,7 +330,7 @@ class RollingOpsManager(Object):
 
         if lock.is_pending():
             self.model.unit.status = WaitingStatus("Awaiting {} operation".format(self.name))
-        elif status.model.unit.status.message == "Awaiting {} operation".format(self.name):
+        elif self.model.unit.status.message == "Awaiting {} operation".format(self.name):
             self.model.unit.status = ActiveStatus()
 
         if lock.is_held():
