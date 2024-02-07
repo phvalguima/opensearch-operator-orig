@@ -397,7 +397,7 @@ class RollingOpsManager(Object):
     def _on_run_with_lock(self: CharmBase, event: RunWithLock):
         lock = Lock(self)
         if not lock.is_held():
-            logger.debug("Lock not held anymore. Abandon this event and reacquire it.")
+            logger.warning("Lock not held anymore. Abandon this event and reacquire it.")
             self.charm.on[self.name].acquire_lock.emit()
             return
 
