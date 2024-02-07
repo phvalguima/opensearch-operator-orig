@@ -396,6 +396,11 @@ class RollingOpsManager(Object):
 
     def _on_run_with_lock(self: CharmBase, event: RunWithLock):
         lock = Lock(self)
+        if not lock.is_held():
+            logger.debug("Lock not held anymore. Abandon this event and reacquire it.")
+            self.charm.on[self.name].acquire_lock.emit()
+            return
+
         self.model.unit.status = MaintenanceStatus("Executing {} operation".format(self.name))
         relation = self.model.get_relation(self.name)
 
@@ -403,8 +408,15 @@ class RollingOpsManager(Object):
         callback_name = relation.data[self.charm.unit].get(
             "callback_override", self._callback.__name__
         )
-        callback = getattr(self.charm, callback_name)
-        callback(event)
+
+        try:
+            callback = getattr(self.charm, callback_name)
+            callback(event)
+        except Exception as e:
+            logger.exception(f"Error running callback {callback_name} failed: {e}")
+
+        if event.deferred:
+            logger.warning("Callback deferred. Release this lock and reacquire it later.")
 
         lock.release()  # Updates relation data
         if lock.unit == self.model.unit:
