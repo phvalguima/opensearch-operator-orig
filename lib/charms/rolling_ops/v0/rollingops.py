@@ -412,18 +412,20 @@ class RollingOpsManager(Object):
         try:
             callback = getattr(self.charm, callback_name)
             callback(event)
+
         except Exception as e:
-            logger.exception(f"Error running callback {callback_name} failed: {e}")
+            logger.error(f"Error running callback {callback_name} failed: {e}")
 
-        if event.deferred:
-            logger.warning("Callback deferred. Release this lock and reacquire it later.")
+        finally:
+            if event.deferred:
+                logger.warning("Callback deferred. Release this lock and reacquire it later.")
 
-        lock.release()  # Updates relation data
-        if lock.unit == self.model.unit:
-            self.charm.on[self.name].process_locks.emit()
+            lock.release()  # Updates relation data
+            if lock.unit == self.model.unit:
+                self.charm.on[self.name].process_locks.emit()
 
-        # cleanup old callback overrides
-        relation.data[self.charm.unit].update({"callback_override": ""})
+            # cleanup old callback overrides
+            relation.data[self.charm.unit].update({"callback_override": ""})
 
-        if self.model.unit.status.message == f"Executing {self.name} operation":
-            self.model.unit.status = ActiveStatus()
+            if self.model.unit.status.message == f"Executing {self.name} operation":
+                self.model.unit.status = ActiveStatus()
