@@ -415,7 +415,7 @@ class RollingOpsManager(Object):
 
         except Exception as e:
             logger.error(f"Error running callback {callback_name} failed: {e}")
-
+            raise e
         finally:
             if event.deferred:
                 logger.warning("Callback deferred. Release this lock and reacquire it later.")
