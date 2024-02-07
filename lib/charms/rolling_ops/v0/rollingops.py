@@ -396,6 +396,11 @@ class RollingOpsManager(Object):
 
     def _on_run_with_lock(self: CharmBase, event: RunWithLock):
         lock = Lock(self)
+        relation = self.model.get_relation(self.name)
+        if not relation:
+            logger.warning("No {} peer relation yet, nothing to do.".format(self.name))
+            return
+
         if not lock.is_held():
             logger.warning("Lock not held anymore. Abandon this event and reacquire it.")
             callback_name = relation.data[self.charm.unit].get(
@@ -406,7 +411,6 @@ class RollingOpsManager(Object):
             return
 
         self.model.unit.status = MaintenanceStatus("Executing {} operation".format(self.name))
-        relation = self.model.get_relation(self.name)
 
         # default to instance callback if not set
         callback_name = relation.data[self.charm.unit].get(
