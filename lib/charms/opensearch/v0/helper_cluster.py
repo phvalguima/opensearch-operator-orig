@@ -352,13 +352,16 @@ class ClusterState:
         """Fetch the cluster health."""
         endpoint = "/_cluster/health"
 
-        # Extra logging: list shards and index status
-        logger.debug(
-            "indices status:\n"
-            f"{opensearch.request('GET', '/_cat/indices?v')}\n"
-            "indices shards:\n"
-            f"{opensearch.request('GET', '/_cat/shards?v')}\n"
-        )
+        try:
+            # Extra logging: list shards and index status
+            logger.debug(
+                "indices status:\n"
+                f"{opensearch.request('GET', '/_cat/indices?v')}\n"
+                "indices shards:\n"
+                f"{opensearch.request('GET', '/_cat/shards?v')}\n"
+            )
+        except Exception:
+            pass
 
         timeout = 5
         if wait_for_green:
