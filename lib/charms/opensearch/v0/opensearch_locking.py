@@ -56,9 +56,9 @@ logger = logging.getLogger(__name__)
 class RollingOpsManagerWithExclusions(RollingOpsManager):
     """Class for controlling the locks in OpenSearch Charm."""
 
-    def __init__(self, charm, callback):
+    def __init__(self, charm, relation, callback):
         """Constructor for RollingOpsManagerWithExclusions."""
-        super().__init__(charm, callback)
+        super().__init__(charm, relation, callback)
         self.ops_lock = charm.ops_lock
 
         # Given the process_locks may abandon relation-changed events because
