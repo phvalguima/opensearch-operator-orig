@@ -21,7 +21,6 @@ from charms.opensearch.v0.constants_charm import (
     COSUser,
     PeerRelationName,
     PluginConfigChangeError,
-    RequestUnitServiceOps,
     SecurityIndexInitProgress,
     ServiceIsStopping,
     ServiceStopped,
@@ -99,6 +98,7 @@ from ops.charm import (
 )
 from ops.framework import EventBase, EventSource
 from ops.model import BlockedStatus, MaintenanceStatus, WaitingStatus
+from tenacity import retry, stop_after_attempt, wait_fixed
 
 # The unique Charmhub library identifier, never change it
 LIBID = "cba015bae34642baa1b6bb27bb35a2f7"
@@ -213,38 +213,62 @@ class OpenSearchBaseCharm(CharmBase):
 
     def _on_start(self, event: StartEvent):
         """Triggered when on start. Set the right node role."""
-        if self.opensearch.is_node_up():
-            if self.peers_data.get(Scope.APP, "security_index_initialised"):
-                # in the case where it was on WaitingToStart status, event got deferred
-                # and the service started in between, put status back to active
-                self.status.clear(WaitingToStart)
+        logger.debug("_on_start: _on_start called")
+        if not self._can_service_start():
+            # We may be dealing with a deferred start event OR the node had a hard reboot
+            # First, checked if we are the leader: if yes, then it can always rerun this event
+            # If not, then we need to start our units once:
+            # - the security index is initialised? If yes, then we can proceed
+            # - the opensearch bootstrap_contributor is set: it means we were in the middle of sth
+            if not self._are_all_tls_resources_stored():
+                self.status.set(BlockedStatus(TLSNotFullyConfigured))
+            else:
+                self.status.set(WaitingStatus(WaitingToStart))
 
-            # cleanup bootstrap conf in the node if existing
-            if self.peers_data.get(Scope.UNIT, "bootstrap_contributor"):
-                self._cleanup_bootstrap_conf_if_applies()
+            logger.debug("_on_start: cannot start yet")
+            event.defer()
             return
 
-        if not self._is_tls_fully_configured():
-            self.status.set(BlockedStatus(TLSNotFullyConfigured))
+        # configure clients auth
+        self.opensearch_config.set_client_auth()
+        logger.debug("_on_start: client auth set")
+
+        if self.unit.is_leader():
+            # run peer cluster manager processing
+            # The cluster needs to have a description in order to proceed with the start
+            self.opensearch_peer_cm.run()
+            logger.debug("_on_start: CM ran")
+        elif not self.opensearch_peer_cm.deployment_desc():
+            # deployment desc not initialized yet by leader
             event.defer()
             return
 
         self.status.clear(TLSNotFullyConfigured)
-
-        # configure clients auth
-        self.opensearch_config.set_client_auth()
-
-        if not self._can_service_start():
-            event.defer()
-            return
+        self.status.clear(WaitingToStart)
 
         # apply the directives computed and emitted by the peer cluster manager
         if not self._apply_peer_cm_directives_and_start():
+            logger.debug("_on_start: peer cm directives missing")
             event.defer()
             return
 
+        logger.debug("_on_start: is started already?")
+        if self.opensearch.is_node_up():
+            # No point in requesting a restart given the system is up.
+            # That means there is/was a "_restart_opensearch" call that already
+            # handled the start process, or this is a recovery from an error in
+            # that said _restart_opensearch call.
+            # In any case, there is nothing for the _on_start logic anymore.
+            return
+        if self.opensearch.is_started():
+            # We have a system that is not up, but it's started. Wait for it to be fully up.
+            event.defer()
+            return
+
+        logger.debug("_on_start: starting service....")
         # request the start of OpenSearch
-        self.status.set(WaitingStatus(RequestUnitServiceOps.format("start")))
+        # We cannot interrupt this event: either it succeeds or it fails
+        # if it fails, it should ERROR and be retried later.
         self.on[self.service_manager.name].acquire_lock.emit(
             callback_override="_restart_opensearch"
         )
@@ -267,7 +291,6 @@ class OpenSearchBaseCharm(CharmBase):
                 return False
 
             # request the start of OpenSearch
-            self.status.set(WaitingStatus(RequestUnitServiceOps.format("start")))
             return True
 
         if self.unit.is_leader():
@@ -303,6 +326,7 @@ class OpenSearchBaseCharm(CharmBase):
             not self.peers_data.get(Scope.APP, "security_index_initialised")
             or not self.opensearch.is_node_up()
         ):
+            event.defer()
             return
 
         new_unit_host = unit_ip(self, event.unit, PeerRelationName)
@@ -613,6 +637,7 @@ class OpenSearchBaseCharm(CharmBase):
 
         return self._are_all_tls_resources_stored()
 
+    @retry(stop=stop_after_attempt(20), wait=wait_fixed(15), reraise=True)
     def _start_opensearch(self, _) -> None:  # noqa: C901
         """Start OpenSearch, with a generated or passed conf, if all resources configured."""
         logger.debug("Rolling Ops Manager: _start_opensearch called")
@@ -674,6 +699,7 @@ class OpenSearchBaseCharm(CharmBase):
         # clear waiting to start status
         self.status.clear(WaitingToStart)
 
+    @retry(stop=stop_after_attempt(2), wait=wait_fixed(15), reraise=True)
     def _stop_opensearch(self) -> None:
         """Stop OpenSearch if possible."""
         self.status.set(WaitingStatus(ServiceIsStopping))
@@ -697,7 +723,7 @@ class OpenSearchBaseCharm(CharmBase):
 
         self._start_opensearch(event)
 
-    def _can_service_start(self) -> bool:
+    def _can_service_start(self) -> bool:  # noqa C901
         """Return if the opensearch service can start."""
         # if there are any missing system requirements leave
         missing_sys_reqs = self.opensearch.missing_sys_requirements()
@@ -705,13 +731,25 @@ class OpenSearchBaseCharm(CharmBase):
             self.status.set(BlockedStatus(" - ".join(missing_sys_reqs)))
             return False
 
+        if not self._are_all_tls_resources_stored():
+            return False
+
         if self.unit.is_leader():
+            return True
+
+        if self.peers_data.get(Scope.UNIT, "bootstrap_contributor"):
+            # We were in the middle of something
+            # This likely means we had a failure during start itself, we generated an exception
+            # and we are still holding the lock to finish the restart
             return True
 
         if not self.peers_data.get(Scope.APP, "security_index_initialised", False):
             return False
 
         if not self.alt_hosts:
+            return False
+
+        if not self._is_tls_fully_configured():
             return False
 
         # When a new unit joins, replica shards are automatically added to it. In order to prevent
@@ -721,9 +759,9 @@ class OpenSearchBaseCharm(CharmBase):
             if self.health.apply(use_localhost=False, app=False) == HealthColors.YELLOW_TEMP:
                 return False
         except OpenSearchHttpError:
-            # this means that the leader unit is not reachable (not started yet),
-            # meaning it's a new cluster, so we can safely start the OpenSearch service
-            pass
+            # this means that the leader unit is not reachable (not started yet) - new cluster
+            # We wait for the leader to start, as we are not the leader unit
+            return False
 
         return True
 

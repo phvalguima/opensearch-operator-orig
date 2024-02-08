@@ -93,7 +93,6 @@ class OpenSearchDistribution(ABC):
         """Install the package."""
         pass
 
-    @retry(stop=stop_after_attempt(20), wait=wait_fixed(15), reraise=True)
     def start(self, wait_until_http_200: bool = True):
         """Start the opensearch service."""
 
