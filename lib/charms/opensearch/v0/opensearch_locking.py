@@ -1,7 +1,34 @@
 # Copyright 2023 Canonical Ltd.
 # See LICENSE file for licensing details.
 
-"""Class for Setting configuration in opensearch config files."""
+"""Class for controlling the lock systems in OpenSearch Charm.
+
+There are two types of locks within OpenSearch charm:
+1) The standard rolling-ops library
+2) The OpenSearchOpsLock
+
+The former is used to control rolling operations across the cluster, where
+we can reliably use the peer relation to orchestrate these activities. The
+leader unit will keep the control and will grant the lock to the next unit
+in the relation.
+
+The latter is used to control the removal of units from the cluster. In this
+case, the sensitive operations happen in the storage-detaching event, which
+cannot be deferred or abandoned. This event will trigger a series of steps
+that will flush data to disk and exclude the unit from any voting/allocation.
+
+As everything happening in the storage-detaching must be atomic, we cannot
+rely on the peer relation and events being triggered later on in the process
+in other units. We must use the opensearch itself to store the lock info.
+That assures any unit can access locking information at any time, even during
+a storage-detaching event on a peer unit.
+
+The last important point is that we must avoid having both lock types conceeding
+locks at the same time. For that, the RollingOpsManager is overloaded here
+and the new class will also take the status of OpenSearchOpsLock into account
+before granting locks.
+"""
+
 import logging
 
 from charms.opensearch.v0.constants_charm import PeerRelationName
@@ -10,6 +37,7 @@ from charms.opensearch.v0.opensearch_exceptions import (
     OpenSearchOpsLockAlreadyAcquiredError,
 )
 from charms.opensearch.v0.opensearch_internal_data import Scope
+from charms.rolling_ops.v0.rollingops import RollingOpsManager
 from tenacity import retry, stop_after_attempt, wait_fixed
 
 # The unique Charmhub library identifier, never change it
@@ -25,6 +53,42 @@ LIBPATCH = 1
 logger = logging.getLogger(__name__)
 
 
+class RollingOpsManagerWithExclusions(RollingOpsManager):
+    """Class for controlling the locks in OpenSearch Charm."""
+
+    def __init__(self, charm, callback):
+        """Constructor for RollingOpsManagerWithExclusions."""
+        super().__init__(charm, callback)
+        self.ops_lock = charm.ops_lock
+
+        # Given the process_locks may abandon relation-changed events because
+        # the ops_lock is being held, we must listen to more events.
+        for event in [
+            charm.on.update_status,
+            charm.on[self.name].relation_departed,
+        ]:
+            self.framework.observe(event, self._on_relation_changed)
+
+    def _on_process_locks(self, event):
+        """Method for processing the locks.
+
+        We should only grant a lock here if the ops_lock is free and then,
+        check with the parent RollingOpsManager.
+
+        We need to consider the fact that storage-detaching may be happening.
+        In this case, we should not grant the lock until ops_lock is released.
+        """
+        if not self._charm.model.unit.is_leader():
+            return
+
+        if self.ops_lock.is_held():
+            logger.info("Another unit is being removed, skipping the rolling ops.")
+            return
+
+        # Call the parent method.
+        super()._on_process_locks(event)
+
+
 class OpenSearchOpsLock:
     """This class covers the configuration changes depending on certain actions."""
 
@@ -34,6 +98,24 @@ class OpenSearchOpsLock:
     def __init__(self, charm):
         self._charm = charm
         self._opensearch = charm.opensearch
+
+    def is_held(self):
+        """Method for checking if the lock is held."""
+        try:
+            status_code = self._opensearch.request(
+                "GET",
+                endpoint=f"/{OpenSearchOpsLock.LOCK_INDEX}",
+                host=self._charm.unit_ip if self._opensearch.is_node_up() else None,
+                alt_hosts=self._charm.alt_hosts,
+                retries=3,
+                resp_status_code=True,
+            )
+            if status_code < 300:
+                return True
+        except OpenSearchHttpError as e:
+            logger.warning(f"Error checking for ops_lock: {e}")
+            pass
+        return False
 
     @retry(stop=stop_after_attempt(3), wait=wait_fixed(0.5), reraise=True)
     def acquire(self):
