@@ -78,7 +78,7 @@ class RollingOpsManagerWithExclusions(RollingOpsManager):
         We need to consider the fact that storage-detaching may be happening.
         In this case, we should not grant the lock until ops_lock is released.
         """
-        if not self._charm.model.unit.is_leader():
+        if not self.charm.model.unit.is_leader():
             return
 
         if self.ops_lock.is_held():
