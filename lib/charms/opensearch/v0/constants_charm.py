@@ -60,6 +60,7 @@ PClusterWrongNodesCountForQuorum = (
 
 # Wait status
 RequestUnitServiceOps = "Requesting lock on operation: {}"
+LockRetryLater = "{} postponed: retrying to rerun later"
 
 
 # Maintenance statuses

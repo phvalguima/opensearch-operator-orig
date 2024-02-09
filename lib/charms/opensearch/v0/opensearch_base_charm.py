@@ -31,7 +31,7 @@ from charms.opensearch.v0.constants_charm import (
 )
 from charms.opensearch.v0.constants_secrets import ADMIN_PW, ADMIN_PW_HASH
 from charms.opensearch.v0.constants_tls import TLS_RELATION, CertType
-from charms.opensearch.v0.helper_charm import DeferTriggerEvent, Status
+from charms.opensearch.v0.helper_charm import Status
 from charms.opensearch.v0.helper_cluster import ClusterTopology, Node
 from charms.opensearch.v0.helper_networking import (
     get_host_ip,
@@ -60,6 +60,7 @@ from charms.opensearch.v0.opensearch_health import HealthColors, OpenSearchHealt
 from charms.opensearch.v0.opensearch_internal_data import RelationDataStore, Scope
 from charms.opensearch.v0.opensearch_locking import (
     OpenSearchOpsLock,
+    OpenSearchRetryLockLaterException,
     RollingOpsManagerWithExclusions,
 )
 from charms.opensearch.v0.opensearch_nodes_exclusions import (
@@ -268,7 +269,7 @@ class OpenSearchBaseCharm(CharmBase):
         logger.debug("_on_start: starting service....")
         # request the start of OpenSearch
         # We cannot interrupt this event: either it succeeds or it fails
-        # if it fails, it should ERROR and be retried later.
+        # if it fails, it should be retried later.
         self.on[self.service_manager.name].acquire_lock.emit(
             callback_override="_restart_opensearch"
         )
@@ -717,11 +718,30 @@ class OpenSearchBaseCharm(CharmBase):
     def _restart_opensearch(self, event: EventBase) -> None:
         """Restart OpenSearch if possible."""
         logger.debug("Rolling Ops Manager: Restarting OpenSearch called")
-        if self.opensearch.is_active():
-            self._stop_opensearch()
-            logger.debug("Rolling Ops Manager: stop_opensearch called")
+        retry_restart_later = False
+        service_was_stopped = False
+        try:
+            if self.opensearch.is_active():
+                self._stop_opensearch()
+                service_was_stopped = True
+                logger.debug("Rolling Ops Manager: stop_opensearch called")
 
-        self._start_opensearch(event)
+            self._start_opensearch(event)
+        except OpenSearchError as e:
+            # An error happened: no python-native exception
+            # In this case, we want to retry later
+            logger.error(f"Rolling Ops Manager: Restarting OpenSearch failed: {e}")
+            retry_restart_later = True
+        finally:
+            # in any error, we want to get the service up and running if it
+            # was the case before. That tries to assure we did not lose a node
+            # because we did not restart it correctly in the event of a failure.
+            if service_was_stopped and not self.opensearch.is_active():
+                self.opensearch.start()
+
+            if retry_restart_later:
+                # Message the lock manager we want to retry this lock later.
+                raise OpenSearchRetryLockLaterException()
 
     def _can_service_start(self) -> bool:  # noqa C901
         """Return if the opensearch service can start."""
