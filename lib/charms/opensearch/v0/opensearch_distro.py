@@ -141,6 +141,10 @@ class OpenSearchDistribution(ABC):
 
         return reachable
 
+    def is_active(self) -> bool:
+        """Check if OpenSearch daemon is active."""
+        pass
+
     @abstractmethod
     def is_failed(self) -> bool:
         """Check if OpenSearch daemon has failed."""

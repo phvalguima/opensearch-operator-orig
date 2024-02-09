@@ -98,7 +98,7 @@ from ops.charm import (
     StorageDetachingEvent,
     UpdateStatusEvent,
 )
-from ops.framework import EventBase, EventSource
+from ops.framework import EventBase
 from ops.model import BlockedStatus, MaintenanceStatus, WaitingStatus
 from tenacity import retry, stop_after_attempt, wait_fixed
 
@@ -122,8 +122,6 @@ logger = logging.getLogger(__name__)
 
 class OpenSearchBaseCharm(CharmBase):
     """Base class for OpenSearch charms."""
-
-    defer_trigger_event = EventSource(DeferTriggerEvent)
 
     def __init__(self, *args, distro: Type[OpenSearchDistribution] = None):
         super().__init__(*args)
@@ -357,7 +355,7 @@ class OpenSearchBaseCharm(CharmBase):
         ):
             # we defer because we want the temporary status to be updated
             event.defer()
-            self.defer_trigger_event.emit()
+            return
 
         for relation in self.model.relations.get(ClientRelationName, []):
             self.opensearch_provider.update_endpoints(relation)
@@ -719,7 +717,7 @@ class OpenSearchBaseCharm(CharmBase):
     def _restart_opensearch(self, event: EventBase) -> None:
         """Restart OpenSearch if possible."""
         logger.debug("Rolling Ops Manager: Restarting OpenSearch called")
-        if self.opensearch.is_started():
+        if self.opensearch.is_active():
             self._stop_opensearch()
             logger.debug("Rolling Ops Manager: stop_opensearch called")
 
