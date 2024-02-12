@@ -735,7 +735,9 @@ class OpenSearchBaseCharm(CharmBase):
             self._start_opensearch(event)
         except OpenSearchProvidedRolesException as e:
             logger.error("Restart failed: provided roles are wrong")
-            self.app.status = BlockedStatus(str(e))
+            if self.unit.is_leader():
+                self.app.status = BlockedStatus(str(e))
+            self.unit.status = BlockedStatus(str(e))
             # We do not restart the service.
             # We want to review the provided roles first
             retry_restart_later = False
