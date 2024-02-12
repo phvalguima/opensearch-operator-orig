@@ -3,6 +3,7 @@
 # See LICENSE file for licensing details.
 
 import logging
+import subprocess
 
 import pytest
 from pytest_operator.plugin import OpsTest
@@ -90,6 +91,34 @@ async def test_actions_get_admin_password(ops_test: OpsTest) -> None:
     # 3. test retrieving password from non-supported user
     result = await run_action(ops_test, 0, "get-password", {"username": "non-existent"})
     assert result.status == "failed"
+
+
+@pytest.mark.abort_on_fail
+async def test_check_number_of_restarts(ops_test: OpsTest) -> None:
+    """Test check number of restarts.
+
+    The number of restarts should be 1 for each unit.
+    """
+    for unit in range(DEFAULT_NUM_UNITS):
+        result = int(
+            subprocess.check_output(
+                [
+                    "juju",
+                    "ssh",
+                    f"{APP_NAME}/{unit}",
+                    "--",
+                    "sudo",
+                    "systemctl",
+                    "show",
+                    "snap.opensearch.daemon.service",
+                    "--property=Restarts",
+                ]
+            )
+            .decode()
+            .split("NRestarts=")[1]
+            .split("\n")[0]
+        )
+        assert result == 1
 
 
 @pytest.mark.abort_on_fail

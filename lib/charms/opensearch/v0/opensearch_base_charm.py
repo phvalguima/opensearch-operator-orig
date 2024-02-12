@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Type
 
 from charms.grafana_agent.v0.cos_agent import COSAgentProvider
 from charms.opensearch.v0.constants_charm import (
+    SERVICE_MANAGER,
     AdminUserInitProgress,
     CertsExpirationError,
     ClientRelationName,
@@ -61,7 +62,7 @@ from charms.opensearch.v0.opensearch_internal_data import RelationDataStore, Sco
 from charms.opensearch.v0.opensearch_locking import (
     OpenSearchOpsLock,
     OpenSearchRetryLockLaterException,
-    RollingOpsManagerWithExclusions,
+    OpenSearchRollingOpsManager,
 )
 from charms.opensearch.v0.opensearch_nodes_exclusions import (
     ALLOCS_TO_DELETE,
@@ -114,7 +115,6 @@ LIBAPI = 0
 LIBPATCH = 2
 
 
-SERVICE_MANAGER = "service"
 STORAGE_NAME = "opensearch-data"
 
 
@@ -154,7 +154,7 @@ class OpenSearchBaseCharm(CharmBase):
         self.plugin_manager = OpenSearchPluginManager(self)
         self.backup = OpenSearchBackup(self)
 
-        self.service_manager = RollingOpsManagerWithExclusions(
+        self.service_manager = OpenSearchRollingOpsManager(
             self, relation=SERVICE_MANAGER, callback=self._restart_opensearch
         )
         self.user_manager = OpenSearchUserManager(self)
@@ -646,14 +646,12 @@ class OpenSearchBaseCharm(CharmBase):
 
         # Retrieve the nodes of the cluster, needed to configure this node
         nodes = self._get_nodes(False)
-        # validate the roles prior to starting
-        self.opensearch_peer_cm.validate_roles(nodes, on_new_unit=True)
 
         logger.debug("_start_opensearch: _set_node_conf is being called")
         # Set the configuration of the node
         self._set_node_conf(nodes)
 
-        logger.debug("_start_opensearch: roles validated")
+        logger.debug("_start_opensearch: start service")
 
         self.opensearch.start(
             wait_until_http_200=(
@@ -726,19 +724,32 @@ class OpenSearchBaseCharm(CharmBase):
                 service_was_stopped = True
                 logger.debug("Rolling Ops Manager: stop_opensearch called")
 
+            # Retrieve the nodes of the cluster, needed to configure this node
+            nodes = self._get_nodes(False)
+            # validate the roles prior to starting
+            # We want to do it only once, as we may start the service, which changes
+            # the node count, but we retry the _start_opensearch a couple of times
+            # while the service itself comes up
+            self.opensearch_peer_cm.validate_roles(nodes, on_new_unit=True)
+
             self._start_opensearch(event)
+        except OpenSearchProvidedRolesException as e:
+            logger.error("Restart failed: provided roles are wrong")
+            self.app.status = BlockedStatus(str(e))
+            # We do not restart the service.
+            # We want to review the provided roles first
+            retry_restart_later = False
         except OpenSearchError as e:
             # An error happened: no python-native exception
             # In this case, we want to retry later
-            logger.error(f"Rolling Ops Manager: Restarting OpenSearch failed: {e}")
+            logger.error(f"Restarting OpenSearch failed: {e}")
             retry_restart_later = True
-        finally:
             # in any error, we want to get the service up and running if it
             # was the case before. That tries to assure we did not lose a node
             # because we did not restart it correctly in the event of a failure.
             if service_was_stopped and not self.opensearch.is_active():
                 self.opensearch.start()
-
+        finally:
             if retry_restart_later:
                 # Message the lock manager we want to retry this lock later.
                 raise OpenSearchRetryLockLaterException()
